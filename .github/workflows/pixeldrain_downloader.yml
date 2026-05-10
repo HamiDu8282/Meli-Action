@@ -1,0 +1,190 @@
+name: "Pixeldrain Downloader"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pixeldrain_url:
+        description: "Pixeldrain URL (e.g., https://pixeldrain.com/u/SLZs3jWo)"
+        required: true
+        type: string
+
+      zip_password:
+        description: "Password for archive (leave empty for no password)"
+        required: false
+        default: ""
+        type: string
+
+      max_part_mb:
+        description: "Maximum size per part (MB)"
+        required: false
+        default: "90"
+        type: string
+
+      upload_method:
+        description: "Upload Method"
+        required: true
+        default: "repository"
+        type: choice
+        options:
+          - repository
+          - release
+
+      release_tag:
+        description: "Release Tag"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  pixeldrain-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full curl jq
+
+      - name: Get Download Info
+        id: info
+        shell: bash
+        run: |
+          PIXELDRAIN_URL="${{ github.event.inputs.pixeldrain_url }}"
+
+          # Extract ID from URL
+          if [[ $PIXELDRAIN_URL =~ pixeldrain\.com/u/([a-zA-Z0-9]+) ]]; then
+            FILE_ID="${BASH_REMATCH[1]}"
+          else
+            echo "Invalid Pixeldrain URL format"
+            exit 1
+          fi
+
+          # Get file info from API
+          API_URL="https://pixeldrain.com/api/file/${FILE_ID}/info"
+          INFO=$(curl -s "$API_URL")
+
+          if [[ $(echo "$INFO" | jq -r '.success') != "true" ]]; then
+            echo "Failed to get file info"
+            exit 1
+          fi
+
+          FILENAME=$(echo "$INFO" | jq -r '.name')
+          FILESIZE=$(echo "$INFO" | jq -r '.size')
+
+          # Sanitize filename
+          FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+
+          DOWNLOAD_URL="https://pixeldrain.com/api/file/${FILE_ID}"
+
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+          echo "filesize=$FILESIZE" >> "$GITHUB_OUTPUT"
+
+      - name: Download File
+        id: download
+        shell: bash
+        run: |
+          mkdir -p temp_dl
+
+          DOWNLOAD_URL="${{ steps.info.outputs.download_url }}"
+          FILENAME="${{ steps.info.outputs.filename }}"
+
+          echo "Downloading: $FILENAME"
+
+          curl -L --fail --retry 3 \
+            -o "temp_dl/$FILENAME" \
+            "$DOWNLOAD_URL"
+
+          echo "filepath=temp_dl/$FILENAME" >> "$GITHUB_OUTPUT"
+
+      - name: Create Split Archive
+        id: archive
+        shell: bash
+        run: |
+          FILEPATH="${{ steps.download.outputs.filepath }}"
+          PASS="${{ github.event.inputs.zip_password }}"
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+
+          if [[ -z "$THRESH_MB" || "$THRESH_MB" -le 0 || "$THRESH_MB" -gt 1900 ]]; then
+            THRESH_MB=1800
+          fi
+
+          BASENAME=$(basename "$FILEPATH")
+
+          cd temp_dl || exit 1
+
+          ARCHIVE_BASE="${BASENAME%.*}_$(date +%Y%m%d_%H%M%S)"
+
+          if [ -n "$PASS" ]; then
+            7z a -p"$PASS" -mhe=on -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
+          else
+            7z a -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
+          fi
+
+          if [ -f "${ARCHIVE_BASE}.7z.001" ] && [ ! -f "${ARCHIVE_BASE}.7z.002" ]; then
+            mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
+          fi
+
+          # Remove the original downloaded file to avoid committing large raw downloads.
+          if [ -f "$BASENAME" ]; then
+            rm -f "$BASENAME"
+          fi
+
+          echo "archive_name=${ARCHIVE_BASE}.7z" >> "$GITHUB_OUTPUT"
+
+          cd ..
+
+      - name: Get Current Date
+        id: get_date
+        shell: bash
+        run: |
+          echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Push to Repository
+        if: github.event.inputs.upload_method == 'repository'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p downloads
+
+          mv temp_dl/*.7z* downloads/ 2>/dev/null || true
+
+          git add downloads/
+
+          git commit -m "Pixeldrain Download: ${{ steps.info.outputs.filename }} [skip ci]" || echo "Nothing to commit"
+
+          git push
+
+      - name: Upload to GitHub Releases
+        if: github.event.inputs.upload_method == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag || format('pixeldrain-{0}', github.run_number) }}
+          name: Pixeldrain Download Release
+          body: |
+            Pixeldrain download completed.
+
+            File: ${{ steps.info.outputs.filename }}
+            Size: ${{ steps.info.outputs.filesize }} bytes
+            Date: ${{ steps.get_date.outputs.date }}
+          files: temp_dl/*.7z*
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf temp_dl
